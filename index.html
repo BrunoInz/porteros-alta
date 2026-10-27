@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Registro de cara</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#111;color:#eee}
+ h1{font-size:1.3rem} .caja{background:#222;border-radius:12px;padding:16px;margin:12px 0}
+ [hidden]{display:none !important}
+ .boton{display:block;width:100%;box-sizing:border-box;text-align:center;border:0;
+   background:#2a7;color:#fff;padding:18px;border-radius:10px;font-size:1.15rem;
+   text-decoration:none;margin-top:10px;cursor:pointer}
+ .boton:disabled{background:#444;color:#888} .azul{background:#27a}
+ input[type=file]{display:none} .fotos{display:flex;gap:8px;margin-top:12px}
+ .fotos img{width:31%;aspect-ratio:3/4;object-fit:cover;border-radius:8px}
+ label.check{display:flex;gap:10px;align-items:flex-start;line-height:1.35}
+ label.check input{width:22px;height:22px;flex:none}
+ .mal{color:#f77} .bien{color:#6d6} small{color:#999}
+</style></head>
+<body>
+
+<h1>Registro de cara</h1>
+
+<div class="caja" id="aviso"><small>Verificando el QR…</small></div>
+
+<div class="caja" id="sinbt" hidden>
+ <span>Para registrarte sin internet en el edificio hace falta Bluetooth desde el navegador.
+ En Android usá Chrome. En iPhone instalá la app gratuita Bluefy y abrí este mismo link ahí.</span>
+ <button class="boton azul" id="copiar" type="button">Copiar link</button>
+ <div id="copiado" class="bien" hidden>Link copiado.</div>
+</div>
+
+<div id="pasos" hidden>
+ <div class="caja">
+  <label class="check"><input type="checkbox" id="acepto">
+   <span>Acepto que se guarde un modelo de mi cara para abrir la puerta del
+   edificio. Las fotos no se guardan: se usan para calcularlo y se descartan.
+   El departamento puede borrarlo cuando quiera.</span></label>
+ </div>
+ <div class="caja">
+  <b>Sacate 3 fotos</b><br>
+  <small>De frente, con buena luz, sin anteojos de sol ni gorra. Moviendo apenas la cabeza entre una y otra.</small>
+  <label class="boton" for="foto" id="sacar">Sacar foto 1 de 3</label>
+  <input id="foto" type="file" accept="image/*" capture="user">
+  <div class="fotos" id="fotos"></div>
+  <button class="boton azul" id="enviar" type="button" disabled>Registrarme</button>
+ </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const TUNEL = 'https://alta.visorcom.com.ar/r/';
+const SVC = '59462f12-9543-9999-12c8-58b459a2712d';
+const RX_UUID = '00001a0a-0000-1000-8000-000000000001';
+const ESTADO_UUID = '00001a0a-0000-1000-8000-000000000002';
+const TAMANOS = [509, 244, 180, 20];
+const TOPE_REINTENTOS = 200;
+const FOTOS = 3, LADO_MAX = 640;
+const ALFABETO = /^[A-HJKMNP-Z2-9]{12}$/;
+const MSG_CORTE = 'Se cortó el Bluetooth o se tardó demasiado. Acercate a la pantalla y probá de nuevo.';
+
+let cod = '';
+let fotos = [];
+let mensajes = [];
+let avisarEstado = null;
+
+function aviso(texto, clase) {
+  const s = document.createElement('span');
+  s.textContent = texto;
+  if (clase) s.className = clase;
+  $('aviso').replaceChildren(s);
+}
+
+function pausa(ms) {
+  return new Promise(resolver => setTimeout(resolver, ms));
+}
+
+function codigoDelLink() {
+  const c = location.hash.slice(1).toUpperCase();
+  return ALFABETO.test(c) ? c : '';
+}
+
+// Devuelve {tipo: 'ok' | 'error' | 'bt', texto?}. Cualquier cosa rara va a Bluetooth.
+async function probarTunel(codigo) {
+  const ctrl = new AbortController();
+  const corte = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const r = await fetch(TUNEL + codigo + '/api/enlace', {cache: 'no-store', signal: ctrl.signal});
+    if (r.status === 200) return {tipo: 'ok'};
+    if (r.status === 404) {
+      const d = await r.json();
+      if (d && d.ok === false && typeof d.error === 'string') return {tipo: 'error', texto: d.error};
+    }
+    return {tipo: 'bt'};
+  } catch (e) {
+    return {tipo: 'bt'};
+  } finally {
+    clearTimeout(corte);
+  }
+}
+
+async function iniciar() {
+  cod = codigoDelLink();
+  if (!cod) return aviso('Este QR no es válido. Pedile al departamento uno nuevo.', 'mal');
+  // ?ble: saltea el túnel y va directo a Bluetooth (para probar el camino sin internet con la Pi conectada).
+  if (new URLSearchParams(location.search).has('ble')) return modoBluetooth();
+  const res = await probarTunel(cod);
+  if (res.tipo === 'ok') return location.replace(TUNEL + cod);
+  if (res.tipo === 'error') return aviso(res.texto, 'mal');
+  modoBluetooth();
+}
+
+function modoBluetooth() {
+  if (!navigator.bluetooth) {
+    aviso('Sin conexión con el registro por internet.', 'mal');
+    $('sinbt').hidden = false;
+    return;
+  }
+  aviso('Sin conexión con el registro por internet. Te registrás por Bluetooth: ' +
+        'prendé el Bluetooth (y en Android la ubicación) y quedate cerca de la pantalla del departamento.');
+  $('pasos').hidden = false;
+  refrescar();
+}
+
+async function copiarLink() {
+  try {
+    await navigator.clipboard.writeText(location.href);
+    $('copiado').hidden = false;
+  } catch (e) {
+    aviso('No se pudo copiar. Copiá la dirección de esta página desde el navegador.', 'mal');
+  }
+}
+
+// Se achica en el celular: una foto de 50 MP no le suma nada a la cara y YuNet
+// no detecta caras muy grandes (lado máximo 640 px).
+async function achicar(archivo) {
+  const img = await createImageBitmap(archivo);
+  const k = Math.min(1, LADO_MAX / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * k);
+  c.height = Math.round(img.height * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  img.close();
+  return c.toDataURL('image/jpeg', 0.85);
+}
+
+function refrescar() {
+  $('fotos').replaceChildren();
+  for (const url of fotos) {
+    const i = new Image();
+    i.src = url;
+    $('fotos').appendChild(i);
+  }
+  $('sacar').hidden = fotos.length >= FOTOS;
+  $('sacar').textContent = 'Sacar foto ' + (fotos.length + 1) + ' de ' + FOTOS;
+  $('enviar').disabled = fotos.length < FOTOS || !$('acepto').checked;
+}
+
+function reiniciarBoton() {
+  $('enviar').textContent = 'Registrarme';
+  refrescar();
+}
+
+// Las notificaciones pueden llegar antes de que alguien espere: se guardan en cola.
+function alLlegarEstado(ev) {
+  mensajes = [...mensajes, new TextDecoder().decode(ev.target.value).trim()];
+  if (avisarEstado) avisarEstado();
+}
+
+function esperarEstado(acepta, ms) {
+  return new Promise((resolver, rechazar) => {
+    let corte = null;
+    const terminar = (fn, valor) => {
+      clearTimeout(corte);
+      avisarEstado = null;
+      fn(valor);
+    };
+    const mirar = () => {
+      while (mensajes.length > 0) {
+        const [m] = mensajes;
+        mensajes = mensajes.slice(1);
+        if (m.startsWith('ERROR')) {
+          const e = new Error(m.slice(5).trim() || 'El celular no pudo guardar las fotos.');
+          e.dispositivo = true;
+          return terminar(rechazar, e);
+        }
+        if (acepta(m)) return terminar(resolver, m);
+      }
+    };
+    corte = setTimeout(() => terminar(rechazar, new Error('Tiempo agotado')), ms);
+    avisarEstado = mirar;
+    mirar();
+  });
+}
+
+async function primerTamano(rx, cuerpo) {
+  for (const t of TAMANOS) {
+    try {
+      await rx.writeValueWithoutResponse(cuerpo.subarray(0, t));
+      return t;
+    } catch (e) {
+      // Este tamaño no sirve: probamos el siguiente.
+    }
+  }
+  throw new Error('No se pudo enviar al celular. Acercate y probá de nuevo.');
+}
+
+async function escribirReintentando(rx, trozo) {
+  for (let intento = 0; intento <= TOPE_REINTENTOS; intento++) {
+    try {
+      await rx.writeValueWithoutResponse(trozo);
+      return;
+    } catch (e) {
+      await pausa(20);
+    }
+  }
+  throw new Error('El celular no recibió los datos. Acercate y probá de nuevo.');
+}
+
+async function enviarCuerpo(rx, cuerpo) {
+  const total = cuerpo.length;
+  const tam = await primerTamano(rx, cuerpo);
+  let pos = Math.min(tam, total);
+  $('enviar').textContent = 'Enviando… ' + Math.floor(pos * 100 / total) + '%';
+  while (pos < total) {
+    const trozo = cuerpo.subarray(pos, pos + tam);
+    await escribirReintentando(rx, trozo);
+    pos += trozo.length;
+    $('enviar').textContent = 'Enviando… ' + Math.floor(pos * 100 / total) + '%';
+  }
+}
+
+async function enviarFotos(gatt) {
+  aviso('Conectando con la pantalla del departamento…');
+  const servidor = await gatt.connect();
+  const servicio = await servidor.getPrimaryService(SVC);
+  const rx = await servicio.getCharacteristic(RX_UUID);
+  const estado = await servicio.getCharacteristic(ESTADO_UUID);
+  await estado.startNotifications();
+  estado.addEventListener('characteristicvaluechanged', alLlegarEstado);
+  mensajes = [];
+
+  const cuerpo = new TextEncoder().encode(JSON.stringify({
+    consentimiento: true,
+    fotos: fotos.map(u => u.split(',')[1]),
+  }));
+  await rx.writeValueWithResponse(new TextEncoder().encode('INICIO ' + cod + ' ' + cuerpo.length));
+  await esperarEstado(m => m === 'LISTO', 10000);
+
+  await enviarCuerpo(rx, cuerpo);
+
+  const limite = Date.now() + 90000;
+  const restante = () => Math.max(1, limite - Date.now());
+  const primero = await esperarEstado(m => m === 'SUBIENDO' || m === 'OK', restante());
+  if (primero === 'SUBIENDO') {
+    $('enviar').textContent = 'Registrando…';
+    aviso('Registrando… no cierres esta página.');
+    await esperarEstado(m => m === 'OK', restante());
+  }
+}
+
+async function registrar() {
+  const boton = $('enviar');
+  boton.disabled = true;
+  boton.textContent = 'Buscando la pantalla…';
+  let dispositivo;
+  try {
+    dispositivo = await navigator.bluetooth.requestDevice({
+      filters: [{namePrefix: 'Portero'}],
+      optionalServices: [SVC],
+    });
+  } catch (e) {
+    aviso(e.name === 'NotFoundError'
+      ? 'No se eligió la pantalla. Tocá Registrarme de nuevo y elegí la que dice Portero.'
+      : 'No se pudo usar el Bluetooth. Revisá que esté prendido y probá de nuevo.', 'mal');
+    return reiniciarBoton();
+  }
+
+  const gatt = dispositivo.gatt;
+  try {
+    await enviarFotos(gatt);
+    $('pasos').hidden = true;
+    aviso('¡Listo! Ya estás registrado/a. Ahora la puerta te reconoce.', 'bien');
+  } catch (e) {
+    if (e.dispositivo) {
+      fotos = [];
+      aviso(e.message + ' Sacate las fotos de nuevo.', 'mal');
+    } else {
+      aviso(MSG_CORTE, 'mal');
+    }
+    reiniciarBoton();
+  } finally {
+    avisarEstado = null;
+    if (gatt.connected) gatt.disconnect();
+  }
+}
+
+$('acepto').onchange = refrescar;
+
+$('foto').onchange = async () => {
+  const f = $('foto').files[0];
+  $('foto').value = '';
+  if (!f) return;
+  try {
+    fotos = [...fotos, await achicar(f)];
+  } catch (e) {
+    aviso('No se pudo leer la foto, probá de nuevo.', 'mal');
+  }
+  refrescar();
+};
+
+$('enviar').onclick = registrar;
+$('copiar').onclick = copiarLink;
+
+iniciar();
+</script>
+</body>
+</html>
