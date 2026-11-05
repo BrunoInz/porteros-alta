@@ -26,8 +26,12 @@
 <div class="caja" id="aviso"><small>Verificando el QR…</small></div>
 
 <div class="caja" id="sinbt" hidden>
- <span>Para registrarte sin internet en el edificio hace falta Bluetooth desde el navegador.
+ <span id="sinbt-texto">Para registrarte sin internet en el edificio hace falta Bluetooth desde el navegador.
  En Android usá Chrome. En iPhone instalá la app gratuita Bluefy y abrí este mismo link ahí.</span>
+ <button class="boton" id="bluefy" type="button" hidden>Abrir en Bluefy</button>
+ <a class="boton azul" id="instalar" hidden
+    href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055">Instalar Bluefy (gratis)</a>
+ <div id="instalar-paso" hidden><small>Cuando termine de instalarse, volvé acá y tocá «Abrir en Bluefy».</small></div>
  <button class="boton azul" id="copiar" type="button">Copiar link</button>
  <div id="copiado" class="bien" hidden>Link copiado.</div>
 </div>
@@ -115,16 +119,34 @@ async function iniciar() {
   modoBluetooth();
 }
 
+const ES_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
 function modoBluetooth() {
   if (!navigator.bluetooth) {
     aviso('Sin conexión con el registro por internet.', 'mal');
     $('sinbt').hidden = false;
+    if (ES_IOS) {
+      $('sinbt-texto').textContent = 'Para registrarte desde el iPhone hace falta la app gratuita Bluefy ' +
+        '(Safari no puede usar el Bluetooth). Tocá el botón y la página se abre ahí.';
+      $('bluefy').hidden = false;
+    }
     return;
   }
   aviso('Sin conexión con el registro por internet. Te registrás por Bluetooth: ' +
         'prendé el Bluetooth (y en Android la ubicación) y quedate cerca de la pantalla del departamento.');
   $('pasos').hidden = false;
   refrescar();
+}
+
+// Safari no deja saber si una app está instalada: si a los 2 s seguimos acá, no abrió.
+function abrirBluefy() {
+  location.href = 'bluefy://open?url=' + encodeURIComponent(location.href);
+  setTimeout(() => {
+    if (document.visibilityState !== 'visible') return;
+    $('instalar').hidden = false;
+    $('instalar-paso').hidden = false;
+  }, 2000);
 }
 
 async function copiarLink() {
@@ -343,6 +365,7 @@ $('foto').onchange = async () => {
 
 $('enviar').onclick = registrar;
 $('copiar').onclick = copiarLink;
+$('bluefy').onclick = abrirBluefy;
 
 iniciar();
 </script>
