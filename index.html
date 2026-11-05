@@ -56,7 +56,9 @@ const TUNEL = 'https://alta.visorcom.com.ar/r/';
 const SVC = '59462f12-9543-9999-12c8-58b459a2712d';
 const RX_UUID = '00001a0a-0000-1000-8000-000000000001';
 const ESTADO_UUID = '00001a0a-0000-1000-8000-000000000002';
-const TAMANOS = [509, 244, 180, 20];
+const TOPE_TROZO = 509;      // máximo que acepta un write de 512 de MTU
+const VENTANA = 16;          // trozos entre una pregunta "CUANTO" y la siguiente
+const TOPE_SIN_AVANCE = 20;  // rondas seguidas sin que llegue nada nuevo
 const TOPE_REINTENTOS = 200;
 const FOTOS = 3, LADO_MAX = 640;
 const ALFABETO = /^[A-HJKMNP-Z2-9]{12}$/;
@@ -196,22 +198,12 @@ function esperarEstado(acepta, ms) {
   });
 }
 
-async function primerTamano(rx, cuerpo) {
-  for (const t of TAMANOS) {
-    try {
-      await rx.writeValueWithoutResponse(cuerpo.subarray(0, t));
-      return t;
-    } catch (e) {
-      // Este tamaño no sirve: probamos el siguiente.
-    }
-  }
-  throw new Error('No se pudo enviar al celular. Acercate y probá de nuevo.');
-}
-
-async function escribirReintentando(rx, trozo) {
+// Chrome Android tira "operation already in progress" si el anterior no terminó: se reintenta.
+// Todo lo que se manda es repetible (un trozo repetido se descarta por su posición).
+async function escribirReintentando(rx, trozo, conRespuesta = false) {
   for (let intento = 0; intento <= TOPE_REINTENTOS; intento++) {
     try {
-      await rx.writeValueWithoutResponse(trozo);
+      await (conRespuesta ? rx.writeValueWithResponse(trozo) : rx.writeValueWithoutResponse(trozo));
       return;
     } catch (e) {
       await pausa(20);
@@ -220,16 +212,53 @@ async function escribirReintentando(rx, trozo) {
   throw new Error('El celular no recibió los datos. Acercate y probá de nuevo.');
 }
 
-async function enviarCuerpo(rx, cuerpo) {
-  const total = cuerpo.length;
-  const tam = await primerTamano(rx, cuerpo);
-  let pos = Math.min(tam, total);
+// Cada trozo lleva su posición (4 bytes, little endian) adelante. El iPhone puede tirar escrituras
+// sin respuesta sin avisar: la pantalla solo toma el trozo que sigue, y cada VENTANA trozos se le
+// pregunta cuánto tiene ("CUANTO", con respuesta) y se sigue desde ahí.
+function armarTrozo(cuerpo, pos, tam) {
+  const datos = cuerpo.subarray(pos, pos + tam);
+  const t = new Uint8Array(4 + datos.length);
+  new DataView(t.buffer).setUint32(0, pos, true);
+  t.set(datos, 4);
+  return t;
+}
+
+function mostrarAvance(pos, total) {
   $('enviar').textContent = 'Enviando… ' + Math.floor(pos * 100 / total) + '%';
-  while (pos < total) {
-    const trozo = cuerpo.subarray(pos, pos + tam);
-    await escribirReintentando(rx, trozo);
-    pos += trozo.length;
-    $('enviar').textContent = 'Enviando… ' + Math.floor(pos * 100 / total) + '%';
+}
+
+// Si ya está subiendo, la pantalla contesta al terminar el POST (≤ 8 s). Si se pierde la
+// respuesta, se vuelve a preguntar.
+async function preguntarCuanto(rx) {
+  for (let intento = 1; ; intento++) {
+    await escribirReintentando(rx, new TextEncoder().encode('CUANTO '), true);
+    try {
+      return await esperarEstado(m => m.startsWith('RECIBIDO ') || m === 'SUBIENDO' || m === 'OK', 15000);
+    } catch (e) {
+      if (e.dispositivo || intento >= 3) throw e;
+    }
+  }
+}
+
+// Devuelve el primer estado que no es RECIBIDO (SUBIENDO u OK) cuando la pantalla tiene todo.
+async function enviarCuerpo(rx, cuerpo, mtu) {
+  const total = cuerpo.length;
+  const tam = Math.min(TOPE_TROZO, mtu - 3) - 4;
+  let pos = 0, sinAvance = 0;
+  for (;;) {
+    for (let i = 0, p = pos; i < VENTANA && p < total; i++, p += tam) {
+      await escribirReintentando(rx, armarTrozo(cuerpo, p, tam));
+    }
+    const m = await preguntarCuanto(rx);
+    if (!m.startsWith('RECIBIDO ')) {
+      mostrarAvance(total, total);
+      return m;
+    }
+    const llegado = parseInt(m.slice(9), 10);
+    sinAvance = llegado > pos ? 0 : sinAvance + 1;
+    if (sinAvance > TOPE_SIN_AVANCE) throw new Error('El celular no recibe los datos');
+    pos = llegado;
+    mostrarAvance(pos, total);
   }
 }
 
@@ -247,14 +276,14 @@ async function enviarFotos(gatt) {
     consentimiento: true,
     fotos: fotos.map(u => u.split(',')[1]),
   }));
-  await rx.writeValueWithResponse(new TextEncoder().encode('INICIO ' + cod + ' ' + cuerpo.length));
-  await esperarEstado(m => m === 'LISTO', 10000);
+  await escribirReintentando(rx, new TextEncoder().encode('INICIO ' + cod + ' ' + cuerpo.length), true);
+  const listo = await esperarEstado(m => m.startsWith('LISTO'), 10000);
+  const mtu = parseInt(listo.slice(6), 10) || 23;
 
-  await enviarCuerpo(rx, cuerpo);
+  const primero = await enviarCuerpo(rx, cuerpo, mtu);
 
   const limite = Date.now() + 90000;
   const restante = () => Math.max(1, limite - Date.now());
-  const primero = await esperarEstado(m => m === 'SUBIENDO' || m === 'OK', restante());
   if (primero === 'SUBIENDO') {
     $('enviar').textContent = 'Registrando…';
     aviso('Registrando… no cierres esta página.');
