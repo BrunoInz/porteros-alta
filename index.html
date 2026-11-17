@@ -15,6 +15,8 @@
  .boton:disabled{background:#444;color:#888} .azul{background:#27a}
  input[type=file]{display:none} .fotos{display:flex;gap:8px;margin-top:12px}
  .fotos img{width:31%;aspect-ratio:3/4;object-fit:cover;border-radius:8px}
+ #video{display:block;width:100%;max-height:60vh;object-fit:cover;margin-top:10px;
+   border-radius:10px;background:#000;transform:scaleX(-1)}
  label.check{display:flex;gap:10px;align-items:flex-start;line-height:1.35}
  label.check input{width:22px;height:22px;flex:none}
  .mal{color:#f77} .bien{color:#6d6} small{color:#999}
@@ -48,6 +50,10 @@
   <small>De frente, con buena luz, sin anteojos de sol ni gorra. Moviendo apenas la cabeza entre una y otra.</small>
   <label class="boton" for="foto" id="sacar">Sacar foto 1 de 3</label>
   <input id="foto" type="file" accept="image/*" capture="user">
+  <div id="camara" hidden>
+   <video id="video" autoplay muted playsinline></video>
+   <button class="boton" id="disparar" type="button">Sacar foto 1 de 3</button>
+  </div>
   <div class="fotos" id="fotos"></div>
   <button class="boton azul" id="enviar" type="button" disabled>Registrarme</button>
  </div>
@@ -160,15 +166,73 @@ async function copiarLink() {
 
 // Se achica en el celular: una foto de 50 MP no le suma nada a la cara y YuNet
 // no detecta caras muy grandes (lado máximo 640 px).
+function aJpeg(fuente, ancho, alto) {
+  const k = Math.min(1, LADO_MAX / Math.max(ancho, alto));
+  const c = document.createElement('canvas');
+  c.width = Math.round(ancho * k);
+  c.height = Math.round(alto * k);
+  c.getContext('2d').drawImage(fuente, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.85);
+}
+
 async function achicar(archivo) {
   const img = await createImageBitmap(archivo);
-  const k = Math.min(1, LADO_MAX / Math.max(img.width, img.height));
-  const c = document.createElement('canvas');
-  c.width = Math.round(img.width * k);
-  c.height = Math.round(img.height * k);
-  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-  img.close();
-  return c.toDataURL('image/jpeg', 0.85);
+  try {
+    return aJpeg(img, img.width, img.height);
+  } finally {
+    img.close();
+  }
+}
+
+// En Android la foto se saca dentro de la página. Con el input, Chrome le pasa la foto a la app
+// de la cámara y, si al teléfono le falta RAM, Android cierra Chrome mientras tanto: al volver
+// avisa "no se pudo completar la operación anterior por falta de memoria" y la foto se pierde.
+// En iPhone el input anda (probado con Bluefy) y queda como estaba.
+let camaraEnPagina = !ES_IOS && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+let flujo = null;
+let abriendo = false;  // mientras se espera el permiso o la cámara: que un segundo toque no abra otra
+
+async function abrirCamara() {
+  if (abriendo || flujo) return;
+  abriendo = true;
+  refrescar();
+  try {
+    flujo = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {facingMode: 'user', width: {ideal: 640}, height: {ideal: 480}},
+    });
+    // Si la cámara se corta sola (otra app la toma), el video queda congelado o en negro.
+    flujo.getVideoTracks()[0].onended = () => {
+      cerrarCamara();
+      aviso('Se cortó la cámara. Tocá «Sacar foto» para abrirla de nuevo.', 'mal');
+    };
+    $('video').srcObject = flujo;
+  } catch (e) {
+    camaraEnPagina = false;
+    aviso(e.name === 'NotAllowedError'
+      ? 'La cámara no tiene permiso. Permitila desde el candado de la barra de direcciones y recargá, ' +
+        'o tocá «Sacar foto» para usar la app de la cámara.'
+      : 'No se pudo abrir la cámara en la página. Tocá «Sacar foto» de nuevo para usar la app de la cámara.', 'mal');
+  }
+  abriendo = false;
+  refrescar();
+}
+
+function cerrarCamara() {
+  if (!flujo) return;
+  flujo.getTracks().forEach(t => t.stop());
+  flujo = null;
+  $('video').srcObject = null;
+  refrescar();
+}
+
+// Se guarda el cuadro tal cual (sin espejo, como lo ve la cámara de la puerta).
+function disparar() {
+  const v = $('video');
+  if (!v.videoWidth) return;  // todavía no llegó la primera imagen
+  fotos = [...fotos, aJpeg(v, v.videoWidth, v.videoHeight)];
+  if (fotos.length >= FOTOS) return cerrarCamara();
+  refrescar();
 }
 
 function refrescar() {
@@ -178,8 +242,11 @@ function refrescar() {
     i.src = url;
     $('fotos').appendChild(i);
   }
-  $('sacar').hidden = fotos.length >= FOTOS;
-  $('sacar').textContent = 'Sacar foto ' + (fotos.length + 1) + ' de ' + FOTOS;
+  const texto = 'Sacar foto ' + (fotos.length + 1) + ' de ' + FOTOS;
+  $('sacar').hidden = fotos.length >= FOTOS || flujo !== null || abriendo;
+  $('sacar').textContent = texto;
+  $('disparar').textContent = texto;
+  $('camara').hidden = flujo === null;
   $('enviar').disabled = fotos.length < FOTOS || !$('acepto').checked;
 }
 
@@ -362,6 +429,15 @@ $('foto').onchange = async () => {
   }
   refrescar();
 };
+
+$('sacar').onclick = e => {
+  if (!camaraEnPagina) return;  // el label abre el input: la app de la cámara
+  e.preventDefault();
+  abrirCamara();
+};
+$('disparar').onclick = disparar;
+// Si se sale de la página se suelta la cámara; al volver se toca «Sacar foto» de nuevo.
+document.addEventListener('visibilitychange', () => { if (document.hidden) cerrarCamara(); });
 
 $('enviar').onclick = registrar;
 $('copiar').onclick = copiarLink;
